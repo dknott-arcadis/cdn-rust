@@ -9,4 +9,8 @@ tokio = { version = "1", features = ["full"] }
 http-body-util = "0.1"
 hyper-util = { version = "0.1", features = ["full"] }
 reqwest = { version = "0.12", features = ["stream"] }
-futures-util = { version = "0.3", default-features = false }
+azure_identity = "0.20.0"
+azure_core = { version = "0.20.0", features = ["enable_reqwest"] }
+azure_storage_blobs = "0.20.0"
+azure_storage = "0.20.0"
+futures = "0.3.30"
