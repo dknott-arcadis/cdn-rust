@@ -14,3 +14,6 @@ azure_core = { version = "0.20.0", features = ["enable_reqwest"] }
 azure_storage_blobs = "0.20.0"
 azure_storage = "0.20.0"
 futures = "0.3.30"
+bytes = "1.6.0"
+anyhow = "1.0.86"
+thiserror = "1.0.61"
