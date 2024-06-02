@@ -20,7 +20,7 @@ const DEFAULT_AZURE_STORAGE_ACCOUNT: &str = "sacitdevdev01";
 
 type ChannelPayload = azure_core::Result<Frame<Bytes>>;
 
-async fn get_blob(mut tx: futures::channel::mpsc::Sender<ChannelPayload>) -> Result<()> {
+async fn get_blob(mut tx: mpsc::Sender<ChannelPayload>) -> Result<()> {
     let account = env::var("AZURE_STORAGE_ACCOUNT").unwrap_or_else(|_| {
         println!(
             "AZURE_STORAGE_ACCOUNT not set, using default value of {}",
@@ -58,8 +58,7 @@ fn get_azure_credentials() -> Arc<dyn azure_core::auth::TokenCredential> {
 
 async fn try_get_blob(
     req: Request<hyper::body::Incoming>,
-) -> Result<hyper::Response<http_body_util::combinators::BoxBody<bytes::Bytes, azure_core::Error>>>
-{
+) -> Result<hyper::Response<BoxBody<bytes::Bytes, azure_core::Error>>> {
     let (tx, rx) = mpsc::channel::<ChannelPayload>(32);
 
     let handle: tokio::task::JoinHandle<Result<()>> = tokio::spawn(async move {
@@ -84,7 +83,7 @@ fn empty() -> BoxBody<Bytes, azure_core::Error> {
         .boxed()
 }
 
-fn bad_request() -> hyper::Response<BoxBody<bytes::Bytes, azure_core::Error>> {
+fn bad_request() -> hyper::Response<BoxBody<Bytes, azure_core::Error>> {
     hyper::Response::builder()
         .status(hyper::StatusCode::BAD_REQUEST)
         .body(empty())
@@ -93,8 +92,7 @@ fn bad_request() -> hyper::Response<BoxBody<bytes::Bytes, azure_core::Error>> {
 
 async fn proxy_request(
     req: Request<hyper::body::Incoming>,
-) -> Result<hyper::Response<http_body_util::combinators::BoxBody<bytes::Bytes, azure_core::Error>>>
-{
+) -> Result<hyper::Response<BoxBody<Bytes, azure_core::Error>>> {
     let blob_stream = try_get_blob(req).await;
     let res = if blob_stream.is_ok() {
         blob_stream.unwrap()
@@ -107,7 +105,7 @@ async fn proxy_request(
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn main() -> Result<()> {
     let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
 
     // We create a TcpListener and bind it to 127.0.0.1:3000
@@ -146,7 +144,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_azure_credentials_test() -> azure_core::Result<()> {
+    async fn get_azure_credentials_test() -> Result<()> {
         let creds = get_azure_credentials();
         let scopes = &["https://management.azure.com/.default"];
         let _token = creds.get_token(scopes).await.expect("Error getting token");
