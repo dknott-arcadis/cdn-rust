@@ -1,5 +1,6 @@
 use anyhow::Result;
 use azure_storage::prelude::StorageCredentials;
+use azure_storage_blobs::blob::BlobProperties;
 use azure_storage_blobs::prelude::ClientBuilder;
 use bytes::Bytes;
 use futures::channel::mpsc;
@@ -20,7 +21,7 @@ const DEFAULT_AZURE_STORAGE_ACCOUNT: &str = "sacitdevdev01";
 
 type ChannelPayload = azure_core::Result<Frame<Bytes>>;
 
-async fn get_blob(mut tx: mpsc::Sender<ChannelPayload>) -> Result<()> {
+async fn get_blob(mut tx: mpsc::Sender<ChannelPayload>) -> Result<BlobProperties> {
     let account = env::var("AZURE_STORAGE_ACCOUNT").unwrap_or_else(|_| {
         println!(
             "AZURE_STORAGE_ACCOUNT not set, using default value of {}",
@@ -37,6 +38,7 @@ async fn get_blob(mut tx: mpsc::Sender<ChannelPayload>) -> Result<()> {
         ClientBuilder::new(account, storage_credentials).blob_client(container, blob_name);
 
     blob_client.exists().await?;
+    let blob_properties = blob_client.get_properties().await?;
 
     let mut pageable = blob_client.get().into_stream();
     while let Some(value) = pageable.next().await {
@@ -47,7 +49,7 @@ async fn get_blob(mut tx: mpsc::Sender<ChannelPayload>) -> Result<()> {
         }
     }
 
-    Ok(())
+    Ok(blob_properties.blob.properties)
 }
 
 /// Creates a `DefaultAzureCredential` by default with default options.
@@ -61,18 +63,25 @@ async fn try_get_blob(
 ) -> Result<hyper::Response<BoxBody<bytes::Bytes, azure_core::Error>>> {
     let (tx, rx) = mpsc::channel::<ChannelPayload>(32);
 
-    let handle: tokio::task::JoinHandle<Result<()>> = tokio::spawn(async move {
-        get_blob(tx.clone()).await?;
-        Ok(())
+    let handle: tokio::task::JoinHandle<Result<BlobProperties>> = tokio::spawn(async move {
+        let blob_properties = get_blob(tx.clone()).await?;
+        Ok(blob_properties)
     });
 
     let blob_stream = StreamBody::new(rx);
-    let response = hyper::Response::builder()
+    let mut response = hyper::Response::builder()
         .status(hyper::StatusCode::OK)
         .body(BodyExt::boxed(blob_stream))?;
 
-    let child_result = handle.await?;
-    child_result?;
+    let blob_properties = handle.await??;
+    let response_headers = response.headers_mut();
+    response_headers.insert(hyper::header::CONTENT_TYPE, blob_properties.content_type.parse()?);
+    response_headers.insert(hyper::header::ETAG, blob_properties.etag.to_string().parse()?);
+    // response_headers.insert(hyper::header::LAST_MODIFIED, blob_properties.last_modified.to_string().parse()?);
+
+    if let Some(cache_control) = blob_properties.cache_control {
+        response_headers.insert(hyper::header::CACHE_CONTROL, cache_control.parse()?);
+    }
 
     Ok(response)
 }
