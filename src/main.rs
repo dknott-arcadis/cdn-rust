@@ -1,42 +1,24 @@
-use azure_core::Pageable;
+use anyhow::Result;
 use azure_storage::prelude::StorageCredentials;
-use azure_storage_blobs::blob;
-use azure_storage_blobs::blob::operations::GetBlobResponse;
 use azure_storage_blobs::prelude::ClientBuilder;
+use bytes::Bytes;
 use futures::channel::mpsc;
-use futures::stream::{self, StreamExt};
-use futures::{SinkExt, Stream, TryStreamExt};
+use futures::stream::StreamExt;
+use futures::SinkExt;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, StreamBody};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
-use hyper::{body::Body, Request, body::Frame};
+use hyper::{body::Frame, Request};
 use hyper_util::rt::TokioIo;
 use std::env;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
-use bytes::Bytes;
-use anyhow::Result;
 
 const DEFAULT_AZURE_STORAGE_ACCOUNT: &str = "sacitdevdev01";
 
-type BlobPageResponse = Frame<Bytes>;
-type BlobResponseStream = StreamBody<azure_core::Result<BlobPageResponse>>;
-type ByteStream = azure_core::Result<bytes::Bytes>;
 type ChannelPayload = azure_core::Result<Frame<Bytes>>;
-
-// fn get_page_data(page: azure_core::Result<GetBlobResponse>) -> BlobResponseStream {
-//     let c = page.map(move |d| d.data).unwrap();
-//     let c2: stream::Map<azure_core::ResponseBody, impl FnMut(Result<Bytes, azure_core::Error>) -> Frame<Bytes>> = c.map(|d| Frame::data(d.unwrap()));
-//     // let c2 = c.map(|b| hyper::body::Frame::data(b.unwrap()));
-//     http_body_util::StreamBody::new(c2)
-//     // page.map(move |d| d.data).unwrap().map(|d| http_body_util::StreamBody::new(d))
-// }
-
-// fn get_blob_stream(pageable: Pageable<GetBlobResponse, azure_core::Error>) -> impl Stream<Item = ByteStream> {
-//    pageable.flat_map(move |f| get_page_data(f))
-// }
 
 async fn get_blob(mut tx: futures::channel::mpsc::Sender<ChannelPayload>) -> Result<()> {
     let account = env::var("AZURE_STORAGE_ACCOUNT").unwrap_or_else(|_| {
@@ -56,70 +38,16 @@ async fn get_blob(mut tx: futures::channel::mpsc::Sender<ChannelPayload>) -> Res
 
     blob_client.exists().await?;
 
-    
-    
-    // let stream_blob = move |(mut pages, page): (Pageable<GetBlobResponse, azure_core::Error>, Option<Result<GetBlobResponse, azure_core::Error>>)| {
-    //     async move {
-    //         let response_body = match page {
-    //             Some(page_data) => Some(page_data.unwrap().data),
-    //             None => match pages.next().await {
-    //                 Some(page_data) => Some(page_data.unwrap().data),
-    //                 None => None
-    //             }
-    //         };
-    //         let chunk_data = match response_body {
-    //             Some(mut page_data) => page_data.next().await,
-    //             None => None
-    //         };
-            
-    //         match chunk_data {
-    //             Some(data) => Some((data, (pages, page, response_body))),
-    //             None => None
-    //         }
-
-    //         // if page.is_some() {
-    //         //     let mut body = page.unwrap().data;
-    //         //     let next_chunk = body.next().await;
-    //         // } else {
-    //         //     None
-    //         // }
-    //     }
-    // };
-
-    // let get_page_contents: dyn Fn(Result<GetBlobResponse, azure_core::Error>) -> Result<azure_core::ResponseBody, azure_core::Error> = move |page: azure_core::Result<GetBlobResponse>| {
-    //     page.map(|p| p.data)
-    // };
-
-    // let s = blob_client.get().into_stream().flat_map(|f| {
-    //     get_page_data(f)
-    // });
-
     let mut pageable = blob_client.get().into_stream();
     while let Some(value) = pageable.next().await {
-        let body = value.map(|d| d.data).ok();
-         match body {
-            Some(mut body) => {
-                while let Some(value) = body.next().await {
-                    let value = value;
-                    tx.send(value.map(|d| Frame::data(d))).await?;
-                }
-            },
-            None => ()
-        };
+        let mut body = value?.data;
+        while let Some(value) = body.next().await {
+            let value = value;
+            tx.send(value.map(|d| Frame::data(d))).await?;
+        }
     }
 
     Ok(())
-
-    // let mut stream = blob_client.get().into_stream();
-    // while let Some(value) = stream.next().await {
-    //     let mut body = value?.data;
-    //     // For each response, we stream the body instead of collecting it all
-    //     // into one large allocation.
-    //     while let Some(value) = body.next().await {
-    //         let value = value?;
-    //         result.extend(&value);
-    //     }
-    // }
 }
 
 /// Creates a `DefaultAzureCredential` by default with default options.
@@ -130,7 +58,8 @@ fn get_azure_credentials() -> Arc<dyn azure_core::auth::TokenCredential> {
 
 async fn try_get_blob(
     req: Request<hyper::body::Incoming>,
-) -> Result<hyper::Response<http_body_util::combinators::BoxBody<bytes::Bytes, azure_core::Error>>> {
+) -> Result<hyper::Response<http_body_util::combinators::BoxBody<bytes::Bytes, azure_core::Error>>>
+{
     let (tx, rx) = mpsc::channel::<ChannelPayload>(32);
 
     let handle: tokio::task::JoinHandle<Result<()>> = tokio::spawn(async move {
@@ -145,7 +74,7 @@ async fn try_get_blob(
 
     let child_result = handle.await?;
     child_result?;
-    
+
     Ok(response)
 }
 
@@ -162,7 +91,10 @@ fn bad_request() -> hyper::Response<BoxBody<bytes::Bytes, azure_core::Error>> {
         .unwrap()
 }
 
-async fn proxy_request(req: Request<hyper::body::Incoming>) -> Result<hyper::Response<http_body_util::combinators::BoxBody<bytes::Bytes, azure_core::Error>>> {
+async fn proxy_request(
+    req: Request<hyper::body::Incoming>,
+) -> Result<hyper::Response<http_body_util::combinators::BoxBody<bytes::Bytes, azure_core::Error>>>
+{
     let blob_stream = try_get_blob(req).await;
     let res = if blob_stream.is_ok() {
         blob_stream.unwrap()
