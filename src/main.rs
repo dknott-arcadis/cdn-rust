@@ -1,41 +1,54 @@
 use anyhow::Result;
 use azure_storage::prelude::StorageCredentials;
 use azure_storage_blobs::blob::BlobProperties;
-use azure_storage_blobs::prelude::ClientBuilder;
+use azure_storage_blobs::prelude::{BlobClient, ClientBuilder};
 use bytes::Bytes;
 use futures::channel::mpsc;
 use futures::stream::StreamExt;
 use futures::SinkExt;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, StreamBody};
-use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{body::Frame, Request};
-use hyper_util::rt::TokioIo;
+use hyper_util::{
+    rt::{TokioExecutor, TokioIo},
+    server::conn::auto::Builder,
+};
 use std::env;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
+use tracing::{debug, info, span, Instrument, Level};
 
 const DEFAULT_AZURE_STORAGE_ACCOUNT: &str = "sacitdevdev01";
 
 type ChannelPayload = azure_core::Result<Frame<Bytes>>;
 
-async fn get_blob(mut tx: mpsc::Sender<ChannelPayload>) -> Result<BlobProperties> {
+fn create_blob_client(container_name: &str, blob_name: &str) -> BlobClient {
     let account = env::var("AZURE_STORAGE_ACCOUNT").unwrap_or_else(|_| {
-        println!(
+        debug!(
             "AZURE_STORAGE_ACCOUNT not set, using default value of {}",
             DEFAULT_AZURE_STORAGE_ACCOUNT
         );
         DEFAULT_AZURE_STORAGE_ACCOUNT.to_owned()
     });
 
+    let storage_credentials = StorageCredentials::token_credential(get_azure_credentials());
+    ClientBuilder::new(account, storage_credentials).blob_client(container_name, blob_name)
+}
+
+async fn get_blob_properties(container_name: &str, blob_name: &str) -> Result<BlobProperties> {
+    let blob_client = create_blob_client(container_name, blob_name);
+    tracing::trace!("Getting blob properties...");
+    let blob_properties = blob_client.get_properties().await?;
+    Ok(blob_properties.blob.properties)
+}
+
+async fn get_blob(mut tx: mpsc::Sender<ChannelPayload>) -> Result<BlobProperties> {
     let container = "test";
     let blob_name = "README.md";
 
-    let storage_credentials = StorageCredentials::token_credential(get_azure_credentials());
-    let blob_client =
-        ClientBuilder::new(account, storage_credentials).blob_client(container, blob_name);
+    let blob_client = create_blob_client(container, blob_name);
 
     blob_client.exists().await?;
     let blob_properties = blob_client.get_properties().await?;
@@ -61,6 +74,23 @@ fn get_azure_credentials() -> Arc<dyn azure_core::auth::TokenCredential> {
 async fn try_get_blob(
     req: Request<hyper::body::Incoming>,
 ) -> Result<hyper::Response<BoxBody<bytes::Bytes, azure_core::Error>>> {
+    if req.headers().contains_key(hyper::header::IF_NONE_MATCH) {
+        let blob_properties = get_blob_properties("test", "README.md").await?;
+        tracing::trace!("Blob properties: {:?}", blob_properties);
+        let etag = req
+            .headers()
+            .get(hyper::header::IF_NONE_MATCH)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        if etag == blob_properties.etag.to_string() {
+            return Ok(hyper::Response::builder()
+                .status(hyper::StatusCode::NOT_MODIFIED)
+                .body(empty())
+                .unwrap());
+        }
+    }
+
     let (tx, rx) = mpsc::channel::<ChannelPayload>(32);
 
     let handle: tokio::task::JoinHandle<Result<BlobProperties>> = tokio::spawn(async move {
@@ -75,13 +105,24 @@ async fn try_get_blob(
 
     let blob_properties = handle.await??;
     let response_headers = response.headers_mut();
-    response_headers.insert(hyper::header::CONTENT_TYPE, blob_properties.content_type.parse()?);
-    response_headers.insert(hyper::header::ETAG, blob_properties.etag.to_string().parse()?);
+    response_headers.insert(
+        hyper::header::CONTENT_TYPE,
+        blob_properties.content_type.parse()?,
+    );
+    response_headers.insert(
+        hyper::header::ETAG,
+        blob_properties.etag.to_string().parse()?,
+    );
     // response_headers.insert(hyper::header::LAST_MODIFIED, blob_properties.last_modified.to_string().parse()?);
 
     if let Some(cache_control) = blob_properties.cache_control {
         response_headers.insert(hyper::header::CACHE_CONTROL, cache_control.parse()?);
     }
+
+    response_headers.insert(
+        hyper::header::CONTENT_LENGTH,
+        blob_properties.content_length.to_string().parse()?,
+    );
 
     Ok(response)
 }
@@ -107,7 +148,7 @@ async fn proxy_request(
         blob_stream.unwrap()
     } else {
         let err = blob_stream.unwrap_err();
-        println!("Error: {:?}", err);
+        tracing::error!("Error: {:?}", err);
         bad_request()
     };
     Ok(res)
@@ -115,30 +156,39 @@ async fn proxy_request(
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_max_level(Level::TRACE)
+        .init();
+
     let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
+    let server_span = span!(Level::TRACE, "server", %addr);
+    let tcp_listener = TcpListener::bind(addr).await?;
 
-    // We create a TcpListener and bind it to 127.0.0.1:3000
-    let listener = TcpListener::bind(addr).await?;
-
-    // We start a loop to continuously accept incoming connections
+    let mut join_set = tokio::task::JoinSet::new();
     loop {
-        let (stream, _) = listener.accept().await?;
-
-        // Use an adapter to access something implementing `tokio::io` traits as if they implement
-        // `hyper::rt` IO traits.
-        let io = TokioIo::new(stream);
-
-        // Spawn a tokio task to serve multiple connections concurrently
-        tokio::task::spawn(async move {
-            // Finally, we bind the incoming connection to our `hello` service
-            if let Err(err) = http1::Builder::new()
-                // `service_fn` converts our function in a `Service`
-                .serve_connection(io, service_fn(proxy_request))
-                .await
-            {
-                eprintln!("Error serving connection: {:?}", err);
+        let (stream, addr) = match tcp_listener.accept().await {
+            Ok(x) => x,
+            Err(e) => {
+                tracing::error!("failed to accept connection: {e}");
+                continue;
             }
-        });
+        };
+
+        let serve_connection = async move {
+            tracing::trace!("handling a request from {addr}");
+
+            let result = Builder::new(TokioExecutor::new())
+                .serve_connection(TokioIo::new(stream), service_fn(proxy_request))
+                .await;
+
+            if let Err(e) = result {
+                tracing::error!("error serving {addr}: {e}");
+            }
+
+            tracing::trace!("handled a request from {addr}");
+        };
+
+        join_set.spawn(serve_connection.instrument(server_span.clone()));
     }
 }
 

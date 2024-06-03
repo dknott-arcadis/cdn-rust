@@ -1,3 +1,5 @@
+include local.mk
+
 build: target/debug/cdn-rust
 
 target/release/cdn-rust: src/main.rs Cargo.toml
