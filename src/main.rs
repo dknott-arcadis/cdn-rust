@@ -16,13 +16,20 @@ use hyper_util::{
 };
 use std::env;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::net::TcpListener;
 use tracing::{debug, info, span, Instrument, Level};
 
 const DEFAULT_AZURE_STORAGE_ACCOUNT: &str = "sacitdevdev01";
 
 type ChannelPayload = azure_core::Result<Frame<Bytes>>;
+
+/// Creates a `DefaultAzureCredential` by default with default options.
+/// If `AZURE_CREDENTIAL_KIND` environment variable is set, it creates a `SpecificAzureCredential` with default options
+fn get_azure_credentials() -> &'static Arc<dyn azure_core::auth::TokenCredential> {
+    static AZURE_CREDENTIALS: OnceLock<Arc<dyn azure_core::auth::TokenCredential>> = OnceLock::new();
+    AZURE_CREDENTIALS.get_or_init(|| azure_identity::create_credential().expect("Unable to create Azure credentials!"))
+}
 
 fn create_blob_client(container_name: &str, blob_name: &str) -> BlobClient {
     let account = env::var("AZURE_STORAGE_ACCOUNT").unwrap_or_else(|_| {
@@ -33,7 +40,7 @@ fn create_blob_client(container_name: &str, blob_name: &str) -> BlobClient {
         DEFAULT_AZURE_STORAGE_ACCOUNT.to_owned()
     });
 
-    let storage_credentials = StorageCredentials::token_credential(get_azure_credentials());
+    let storage_credentials = StorageCredentials::token_credential(get_azure_credentials().clone());
     ClientBuilder::new(account, storage_credentials).blob_client(container_name, blob_name)
 }
 
@@ -63,12 +70,6 @@ async fn get_blob(mut tx: mpsc::Sender<ChannelPayload>) -> Result<BlobProperties
     }
 
     Ok(blob_properties.blob.properties)
-}
-
-/// Creates a `DefaultAzureCredential` by default with default options.
-/// If `AZURE_CREDENTIAL_KIND` environment variable is set, it creates a `SpecificAzureCredential` with default options
-fn get_azure_credentials() -> Arc<dyn azure_core::auth::TokenCredential> {
-    azure_identity::create_credential().expect("Unable to create Azure credentials!")
 }
 
 async fn try_get_blob(
