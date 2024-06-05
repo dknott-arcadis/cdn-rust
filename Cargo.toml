@@ -4,18 +4,10 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-hyper = { version = "1", features = ["full"] }
 tokio = { version = "1", features = ["full"] }
-http-body-util = "0.1"
-hyper-util = { version = "0.1", features = ["full"] }
 azure_identity = "0.20.0"
 azure_core = { version = "0.20.0", features = ["enable_reqwest"] }
-azure_storage_blobs = "0.20.0"
-azure_storage = "0.20.0"
-futures = "0.3.30"
-bytes = "1.6.0"
 anyhow = "1.0.86"
-thiserror = "1.0.61"
 tracing = { version = "0.1.40", features = ["log"] }
 tracing-subscriber = "0.3.18"
 tracing-opentelemetry = "0.24.0"
@@ -23,3 +15,7 @@ opentelemetry_sdk = { version = "0.23.0", features = ["rt-tokio"] }
 opentelemetry = "0.23.0"
 opentelemetry-otlp = { version = "0.16.0", features = ["metrics"] }
 opentelemetry-semantic-conventions = "0.15.0"
+axum = { version = "0.7.5", features = ["http2"] }
+reqwest = "0.12.4"
+tower-http = { version = "0.5.2", features = ["trace"] }
+bytes = "1.6.0"
